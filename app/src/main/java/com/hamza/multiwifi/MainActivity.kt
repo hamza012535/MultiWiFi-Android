@@ -30,13 +30,16 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,9 +48,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.hamza.multiwifi.probe.ProbeConfig
+import com.hamza.multiwifi.probe.ProbeResult
+import com.hamza.multiwifi.probe.ProbeUiState
+import com.hamza.multiwifi.probe.runProbe
+import com.hamza.multiwifi.wifi.WifiPickerCard
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 private data class NetworkRow(
     val id: String,
+    val network: Network,
     val transport: String,
     val validated: Boolean,
     val metered: Boolean,
@@ -77,6 +88,8 @@ private fun MultiWiFiScreen(context: Context) {
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
     val networks = remember { mutableStateListOf<NetworkRow>() }
+    val probeStates = remember { mutableStateMapOf<String, ProbeUiState>() }
+    val scope = rememberCoroutineScope()
     var lastUpdated by remember { mutableStateOf("Waiting for network information") }
     val wifiConcurrencySupported = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -99,7 +112,27 @@ private fun MultiWiFiScreen(context: Context) {
         }
         networks.clear()
         networks.addAll(current.distinctBy { it.id })
+        // Drop results for networks that are gone.
+        val liveIds = networks.map { it.id }.toSet()
+        probeStates.keys.retainAll(liveIds)
         lastUpdated = "Network snapshot refreshed"
+    }
+
+    suspend fun probe(row: NetworkRow) {
+        if (probeStates[row.id] is ProbeUiState.Running) return
+        probeStates[row.id] = ProbeUiState.Running
+        try {
+            val result = runProbe(row.network)
+            // The network may have disappeared while testing; only store if it is still listed.
+            if (networks.any { it.id == row.id }) probeStates[row.id] = ProbeUiState.Done(result)
+        } catch (e: CancellationException) {
+            probeStates.remove(row.id)
+            throw e
+        } catch (e: RuntimeException) {
+            if (networks.any { it.id == row.id }) {
+                probeStates[row.id] = ProbeUiState.Done(ProbeResult(null, null, "Test failed: ${e.message ?: e.javaClass.simpleName}"))
+            }
+        }
     }
 
     DisposableEffect(manager) {
@@ -206,6 +239,9 @@ private fun MultiWiFiScreen(context: Context) {
                 }
             }
             item {
+                WifiPickerCard(context = context, onLinkChanged = { refreshSnapshot() })
+            }
+            item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -216,6 +252,18 @@ private fun MultiWiFiScreen(context: Context) {
                         Icon(Icons.Default.Refresh, contentDescription = null)
                         Text(" Refresh")
                     }
+                }
+            }
+            if (networks.isNotEmpty()) {
+                item {
+                    OutlinedButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = probeStates.values.none { it is ProbeUiState.Running },
+                        onClick = {
+                            // One at a time so tests don't compete for the same uplink.
+                            scope.launch { networks.toList().forEach { probe(it) } }
+                        }
+                    ) { Text("Test all paths") }
                 }
             }
             if (networks.isEmpty()) {
@@ -229,12 +277,19 @@ private fun MultiWiFiScreen(context: Context) {
                     }
                 }
             } else {
-                items(networks, key = { it.id }) { row -> NetworkCard(row) }
+                items(networks, key = { it.id }) { row ->
+                    NetworkCard(
+                        row = row,
+                        probeState = probeStates[row.id],
+                        anyRunning = probeStates.values.any { it is ProbeUiState.Running },
+                        onTest = { scope.launch { probe(row) } }
+                    )
+                }
             }
             item {
                 Text(lastUpdated, color = Color(0xFF71849B), fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
-                Text("Privacy: this initial version reads network state only. It does not capture traffic, request Wi-Fi passwords, or start a VPN.",
+                Text("Privacy: this app reads network state, and sends test requests only when you tap a test button. It does not capture traffic, request Wi-Fi passwords, or start a VPN.",
                     color = Color(0xFF71849B), fontSize = 12.sp)
                 Spacer(Modifier.height(28.dp))
             }
@@ -252,6 +307,7 @@ private fun NetworkCapabilities.toRow(network: Network): NetworkRow {
     }
     return NetworkRow(
         id = network.toString(),
+        network = network,
         transport = transport,
         validated = hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
         metered = !hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
@@ -269,7 +325,12 @@ private fun Metric(value: String, label: String) {
 }
 
 @androidx.compose.runtime.Composable
-private fun NetworkCard(row: NetworkRow) {
+private fun NetworkCard(
+    row: NetworkRow,
+    probeState: ProbeUiState?,
+    anyRunning: Boolean,
+    onTest: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -290,8 +351,52 @@ private fun NetworkCard(row: NetworkRow) {
                 color = Color.White, fontSize = 14.sp)
             Text(if (row.metered) "Metered network" else "Reported as unmetered",
                 color = Color(0xFF9FB1C8), fontSize = 12.sp)
+            Divider(color = Color(0xFF294356))
+            ProbeSection(row, probeState, anyRunning, onTest)
         }
     }
+}
+
+@androidx.compose.runtime.Composable
+private fun ProbeSection(
+    row: NetworkRow,
+    state: ProbeUiState?,
+    anyRunning: Boolean,
+    onTest: () -> Unit
+) {
+    val megabytes = ProbeConfig.DOWNLOAD_BYTES / 1_000_000
+    when (state) {
+        is ProbeUiState.Running ->
+            Text("Testing this path…", color = Color(0xFF9BC7FF), fontSize = 13.sp)
+        is ProbeUiState.Done -> ProbeResultText(state.result)
+        null -> Unit
+    }
+    OutlinedButton(onClick = onTest, enabled = !anyRunning) {
+        Text(if (state is ProbeUiState.Done) "Run again" else "Test this path")
+    }
+    Text(
+        "Connects to ${ProbeConfig.HOST} over this network only and downloads about $megabytes MB" +
+            if (row.metered) " (this network is metered)." else ".",
+        color = Color(0xFF71849B), fontSize = 11.sp
+    )
+}
+
+@androidx.compose.runtime.Composable
+private fun ProbeResultText(result: ProbeResult) {
+    result.latency?.let { l ->
+        Text(
+            String.format("Latency %.0f ms median (min %.0f, max %.0f), jitter %.1f ms", l.medianMs, l.minMs, l.maxMs, l.jitterMs),
+            color = Color.White, fontSize = 14.sp
+        )
+        if (l.failures > 0) {
+            Text("${l.failures} of ${l.samples + l.failures} connection attempts failed",
+                color = Color(0xFFFFD28A), fontSize = 12.sp)
+        }
+    }
+    result.downloadMbps?.let {
+        Text(String.format("Download %.1f Mbps (single stream)", it), color = Color.White, fontSize = 14.sp)
+    }
+    result.error?.let { Text(it, color = Color(0xFFFFD28A), fontSize = 12.sp) }
 }
 
 private fun formatKbps(kbps: Int): String =
