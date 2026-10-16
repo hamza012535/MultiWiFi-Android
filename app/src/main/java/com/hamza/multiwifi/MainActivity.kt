@@ -5,6 +5,8 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -76,6 +78,18 @@ private fun MultiWiFiScreen(context: Context) {
     }
     val networks = remember { mutableStateListOf<NetworkRow>() }
     var lastUpdated by remember { mutableStateOf("Waiting for network information") }
+    val wifiConcurrencySupported = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            try {
+                wifiManager.isStaConcurrencyForMultiInternetSupported
+            } catch (_: RuntimeException) {
+                false
+            }
+        } else {
+            false
+        }
+    }
 
     fun refreshSnapshot() {
         val current = manager.allNetworks.mapNotNull { network ->
@@ -145,6 +159,31 @@ private fun MultiWiFiScreen(context: Context) {
                             Metric(value = "$wifiCount", label = "Wi-Fi paths")
                             Metric(value = "$otherCount", label = "Other paths")
                         }
+                    }
+                }
+            }
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF111E30))
+                ) {
+                    Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Phone Wi-Fi capability check", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                        Text(
+                            when {
+                                Build.VERSION.SDK_INT < Build.VERSION_CODES.S ->
+                                    "Android 12 or newer is required for this public multi-internet Wi-Fi capability check."
+                                wifiConcurrencySupported ->
+                                    "This phone reports support for Wi-Fi multi-internet concurrency. This is promising, but does not guarantee this app can connect or aggregate two networks."
+                                else ->
+                                    "This phone does not report support for Wi-Fi multi-internet concurrency. Ordinary apps may be unable to keep two independent Wi-Fi internet connections active at once."
+                            },
+                            color = if (wifiConcurrencySupported) Color(0xFF72E5C2) else Color(0xFFFFD28A),
+                            fontSize = 13.sp
+                        )
+                        Text("This checks a system capability flag only; it does not connect to another network or combine bandwidth.",
+                            color = Color(0xFF9FB1C8), fontSize = 12.sp)
                     }
                 }
             }
