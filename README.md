@@ -47,4 +47,4 @@ Android references: https://developer.android.com/develop/connectivity/network-o
 
 ## License
 
-Apache-2.0. See LICENSE.
+MIT. See LICENSE.
